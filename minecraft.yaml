@@ -1,0 +1,311 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Minecraft Bedrock Server for Expo App
+
+Parameters:
+  AppPassword:
+    Type: String
+    Description: "[Required] Password for App connection (Min 4 characters)"
+    NoEcho: true
+    MinLength: 4
+
+  VersionControlUrl:
+    Type: String
+    Description: "URL of the text file containing the Bedrock Server download link."
+    Default: "https://raw.githubusercontent.com/superrelax102/MineCraftApp_public/refs/heads/main/bedrock_url.txt"
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    Description: "Server Instance Type (Recommended: t3.medium)"
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+
+Resources:
+  # ------------------------------------------------------------
+  # 1. IAM Roles
+  # ------------------------------------------------------------
+  Ec2SsmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2SsmRole
+
+  LambdaControlRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+  LambdaControlPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: MinecraftControlPolicy
+      Roles:
+        - !Ref LambdaControlRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # 1. 特定のEC2インスタンスのみ操作許可
+          - Effect: Allow
+            Action:
+              - ec2:StartInstances
+              - ec2:StopInstances
+              - ec2:DescribeInstances
+              - ec2:DescribeInstanceStatus
+              - ssm:SendCommand
+              - ssm:GetCommandInvocation
+            Resource: 
+              - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${MinecraftServer}"
+              # SSMコマンド実行にはDocumentリソースへの権限も必要になる場合があるが、
+              # DocumentName: "AWS-RunShellScript" は標準的なので一旦インスタンス制御のみに注力
+          # 2. ログ出力（これは * でOK）
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: "*"
+
+  # ------------------------------------------------------------
+  # 2. Network & Security
+  # ------------------------------------------------------------
+  MinecraftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable UDP access for Minecraft Bedrock
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 19132
+          ToPort: 19132
+          CidrIp: 0.0.0.0/0
+
+  # ------------------------------------------------------------
+  # 3. EC2 Instance (Ubuntu 24.04)
+  # ------------------------------------------------------------
+  MinecraftServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: '{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}}'
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      SecurityGroups:
+        - !Ref MinecraftSecurityGroup
+      
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt-get update -y
+          apt-get install -y unzip curl wget libcurl4
+          
+          mkdir -p /home/ubuntu/minecraft
+          cd /home/ubuntu/minecraft
+          
+          URL=$(curl -s ${VersionControlUrl} | tr -d '\r\n')
+          
+          wget "$URL" -O bedrock-server.zip
+          unzip -o bedrock-server.zip
+          
+          chown -R ubuntu:ubuntu /home/ubuntu/minecraft
+          chmod +x /home/ubuntu/minecraft/bedrock_server
+          
+          cat <<EOF > /etc/systemd/system/minecraft.service
+          [Unit]
+          Description=Minecraft Bedrock Server
+          After=network.target
+          
+          [Service]
+          User=ubuntu
+          WorkingDirectory=/home/ubuntu/minecraft
+          Environment="LD_LIBRARY_PATH=."
+          ExecStart=/home/ubuntu/minecraft/bedrock_server
+          Restart=always
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          systemctl daemon-reload
+          systemctl enable minecraft
+          systemctl start minecraft
+
+  # ------------------------------------------------------------
+  # 4. Auto Stop Alarm
+  # ------------------------------------------------------------
+  AutoStopAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "Minecraft-AutoStop-${MinecraftServer}"
+      AlarmDescription: "Stop instance if CPU < 5% for 30 minutes"
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 6
+      Threshold: 5
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref MinecraftServer
+      AlarmActions:
+        - !Sub "arn:aws:automate:${AWS::Region}:ec2:stop"
+
+  # ------------------------------------------------------------
+  # 5. API Backend (Lambda + API Gateway)
+  # ------------------------------------------------------------
+  ControlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaControlRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 15 # SSM実行待ちのため少し延長
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref MinecraftServer
+          APP_PASSWORD: !Ref AppPassword
+          VERSION_URL: !Ref VersionControlUrl
+      Code:
+        ZipFile: |
+          const { EC2Client, StartInstancesCommand, StopInstancesCommand, DescribeInstancesCommand } = require("@aws-sdk/client-ec2");
+          const { SSMClient, SendCommandCommand } = require("@aws-sdk/client-ssm");
+          
+          const ec2Client = new EC2Client();
+          const ssmClient = new SSMClient();
+
+          exports.handler = async (event) => {
+            const envPass = process.env.APP_PASSWORD;
+            const versionUrl = process.env.VERSION_URL;
+            let body = {};
+            try { body = JSON.parse(event.body || '{}'); } catch (e) {}
+            
+            if (envPass && body.password !== envPass) {
+                return { statusCode: 401, body: JSON.stringify({ message: "Incorrect Password" }) };
+            }
+
+            const instanceId = process.env.INSTANCE_ID;
+            const action = body.action;
+
+            try {
+                if (action === 'start') {
+                    await ec2Client.send(new StartInstancesCommand({ InstanceIds: [instanceId] }));
+                    return { statusCode: 200, body: JSON.stringify({ message: "Server Starting..." }) };
+                } 
+                else if (action === 'stop') {
+                    await ec2Client.send(new StopInstancesCommand({ InstanceIds: [instanceId] }));
+                    return { statusCode: 200, body: JSON.stringify({ message: "Server Stopping..." }) };
+                } 
+                else if (action === 'status') {
+                    const data = await ec2Client.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
+                    const instance = data.Reservations[0].Instances[0];
+                    const state = instance.State.Name;
+                    const ip = (state === 'running') ? instance.PublicIpAddress : "Stopped";
+                    return { statusCode: 200, body: JSON.stringify({ state: state, ip: ip }) };
+                }
+                else if (action === 'update') {
+                    //  OS更新 & マイクラ更新コマンド
+                    // 1. サービス停止 -> 2. OS更新(非対話) -> 3. 最新版DL -> 4. 解凍(設定ファイルは維持) -> 5. 起動
+                    const commands = [
+                        'echo "Starting Update Process..."',
+                        'systemctl stop minecraft',
+                        'apt-get update -y',
+                        'DEBIAN_FRONTEND=noninteractive apt-get upgrade -y',
+                        `URL=$(curl -s ${versionUrl} | tr -d '\r\n')`,
+                        'wget "$URL" -O /home/ubuntu/minecraft/bedrock-server.zip',
+                        'unzip -o /home/ubuntu/minecraft/bedrock-server.zip -d /home/ubuntu/minecraft -x server.properties permissions.json allowlist.json',
+                        'chown -R ubuntu:ubuntu /home/ubuntu/minecraft',
+                        'chmod +x /home/ubuntu/minecraft/bedrock_server',
+                        'systemctl start minecraft',
+                        'echo "Update Completed!"'
+                    ];
+
+                    const command = new SendCommandCommand({
+                        InstanceIds: [instanceId],
+                        DocumentName: "AWS-RunShellScript",
+                        Parameters: { commands: commands }
+                    });
+                    
+                    await ssmClient.send(command);
+                    return { statusCode: 200, body: JSON.stringify({ message: "Update command sent! Check logs in a few minutes." }) };
+                }
+                else {
+                    return { statusCode: 400, body: JSON.stringify({ message: "Invalid action" }) };
+                }
+            } catch (err) {
+                console.error(err);
+                return { statusCode: 500, body: JSON.stringify({ message: err.message }) };
+            }
+          };
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: MinecraftControlApi
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - POST
+        AllowHeaders:
+          - Content-Type
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ControlFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /control"
+      Target: !Join [ "/", [ "integrations", !Ref ApiIntegration ] ]
+
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ControlFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/control"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5  # 瞬間的に5回まで
+        ThrottlingRateLimit: 2   # 秒間2回まで
+
+Outputs:
+  ApiUrl:
+    Description: "API Endpoint URL"
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/control"
+  InstanceId:
+    Description: "Minecraft EC2 Instance ID"
+    Value: !Ref MinecraftServer
