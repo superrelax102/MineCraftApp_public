@@ -6,8 +6,12 @@
 
 「専用サーバーを作りたいが、月額式のレンタルサーバーは高いし、自分でサーバーを構築するのは難しすぎる」という方の課題をAWSとReact Nativeを用いて解決しました。
 
-## アーキテクチャ (Architecture)
+## アーキテクチャ
 <img width="1768" height="487" alt="image" src="https://github.com/user-attachments/assets/ce94953e-25dd-481a-9911-3093a97629ad" />
+
+## 画面イメージ
+<img width="334" height="726" alt="image" src="https://github.com/user-attachments/assets/353f5205-1979-4172-952f-3ebc336ba7d4" />
+<img width="333" height="723" alt="image" src="https://github.com/user-attachments/assets/29c28406-2665-4445-9419-6c0b7b457094" />
 
 ### 採用技術スタック
 * **Frontend:** React Native (Expo)
